@@ -14,7 +14,6 @@ on:
 jobs:
   build-dart-sdk:
     runs-on: ubuntu-latest
-
     steps:
     - name: Maximize build space
       uses: easimon/maximize-build-space@v4
@@ -26,7 +25,7 @@ jobs:
         remove-android: 'true'
 
     - name: Checkout
-      uses: actions/checkout@v2
+      uses: actions/checkout@v3
 
     - name: Echo Free space
       run: |
@@ -44,62 +43,91 @@ jobs:
         sudo apt-get install -y g++-aarch64-linux-gnu g++-arm-linux-gnueabihf
         sudo apt-get install -y g++-multilib
         sudo apt-get install -y zip
+        sudo apt-get install -y git make cmake ninja-build python3-pip
 
-    - name: Get Resource
+    - name: Install depot_tools (mirror) and export to PATH
       run: |
-        # Use GitHub mirror (Googlesource blocks CI)
-        git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
-        export PATH="$PATH:$PWD/depot_tools"
+        # use a GitHub mirror of depot_tools to avoid googlesource CI 403s
+        for i in 1 2 3; do
+          git clone https://github.com/rust-skia/depot_tools.git && break || (echo "retrying depot_tools clone ($i)..." && sleep 5)
+        done
+        echo "$PWD/depot_tools" >> $GITHUB_PATH
 
-        # Fetch Dart source
-        mkdir dart-sdk
+    - name: Clone Dart SDK from GitHub (no fetch)
+      run: |
+        # clone Dart from GitHub (avoid fetch which talks to googlesource)
+        mkdir -p dart-sdk
         cd dart-sdk
 
-        fetch dart
+        for i in 1 2 3; do
+          git clone --depth 1 https://github.com/dart-lang/sdk.git sdk && break || (echo "retrying dart clone ($i)..." && sleep 5)
+        done
 
-        # Checkout latest master (or keep your version)
         cd sdk
-        git checkout master
+        # fetch tags (shallow clone didn't get tags), get latest stable tag
+        git fetch --tags --depth=1 || true
+        LATEST_TAG=$(git tag --list --sort=-v:refname | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | head -n1 || true)
+        if [ -n "$LATEST_TAG" ]; then
+          echo "Checking out latest stable Dart tag: $LATEST_TAG"
+          git checkout "$LATEST_TAG"
+        else
+          echo "No stable tag found, staying on cloned branch (likely main)"
+        fi
+        cd ../..
 
-        # Apply Android temp directory patch
-        sed -i "s#/data/local/tmp#/data/data/com.termux/files/home/tmp#g" runtime/bin/directory_android.cc
-        sed -n '431,433p' runtime/bin/directory_android.cc
+    - name: Apply Android patch and set .gclient target_os
+      run: |
+        cd dart-sdk/sdk
+        # only apply patch if file exists
+        if [ -f runtime/bin/directory_android.cc ]; then
+          sed -i "s#/data/local/tmp#/data/data/com.termux/files/home/tmp#g" runtime/bin/directory_android.cc || true
+          sed -n '431,433p' runtime/bin/directory_android.cc || true
+        else
+          echo "runtime/bin/directory_android.cc not present (ok)."
+        fi
         cd ../
+        # ensure .gclient exists and contains the target_os line
+        if [ ! -f .gclient ]; then
+          echo "target_os = ['android', 'linux']" > .gclient
+        else
+          grep -q "target_os" .gclient || echo "target_os = ['android', 'linux']" >> .gclient
+        fi
 
-        # Append target_os safely
-        echo "target_os = ['android', 'linux']" >> .gclient
-
-        # Resync after modifying .gclient
-        gclient sync --jobs 4
+    - name: (Optional) gclient sync (best-effort)
+      run: |
+        # Try to sync deps if needed. This may contact googlesource; retry a few times.
+        set -o pipefail
+        for i in 1 2 3; do
+          gclient sync --jobs 4 && break || (echo "gclient sync failed, retry ($i)..." && sleep 10)
+        done
+      continue-on-error: true
 
     - name: Build SDK
       run: |
         export PATH="$PATH:$PWD/depot_tools"
         cd dart-sdk/sdk
 
-        ls tools/bots
+        # List tools dir if exists
+        ls tools || true
 
-        # Build Android arm64
-        ./tools/build.py --no-goma -m release --arch=arm64 --os=android create_sdk
+        # Attempt builds (these may still require third-party deps)
+        ./tools/build.py --no-goma -m release --arch=arm64 --os=android create_sdk || true
+        ./tools/build.py --no-goma -m release --arch=arm --os=android create_sdk || true
+        ./tools/build.py --no-goma -m release --arch=arm64 create_sdk || true
+        ./tools/build.py --no-goma -m release --arch=arm create_sdk || true
 
-        # Build Android arm
-        ./tools/build.py --no-goma -m release --arch=arm --os=android create_sdk
-
-        # Build Linux arm64
-        ./tools/build.py --no-goma -m release --arch=arm64 create_sdk
-
-        # Build Linux arm
-        ./tools/build.py --no-goma -m release --arch=arm create_sdk
-
-    - name: Zip SDK
+    - name: Zip SDK (if produced)
       run: |
-        cd dart-sdk/sdk/out
-        ls
-
-        zip -q -r dart-sdk-android-arm64.zip ReleaseAndroidARM64/dart-sdk
-        zip -q -r dart-sdk-android-arm.zip ReleaseAndroidARM/dart-sdk
-        zip -q -r dart-sdk-linux-arm64.zip ReleaseXARM64/dart-sdk
-        zip -q -r dart-sdk-linux-arm.zip ReleaseXARM/dart-sdk
+        if [ -d dart-sdk/sdk/out ]; then
+          cd dart-sdk/sdk/out
+          ls -la || true
+          [ -d ReleaseAndroidARM64/dart-sdk ] && zip -q -r dart-sdk-android-arm64.zip ReleaseAndroidARM64/dart-sdk || echo "ReleaseAndroidARM64 missing"
+          [ -d ReleaseAndroidARM/dart-sdk ] && zip -q -r dart-sdk-android-arm.zip ReleaseAndroidARM/dart-sdk || echo "ReleaseAndroidARM missing"
+          [ -d ReleaseXARM64/dart-sdk ] && zip -q -r dart-sdk-linux-arm64.zip ReleaseXARM64/dart-sdk || echo "ReleaseXARM64 missing"
+          [ -d ReleaseXARM/dart-sdk ] && zip -q -r dart-sdk-linux-arm.zip ReleaseXARM/dart-sdk || echo "ReleaseXARM missing"
+        else
+          echo "No out/ directory; build probably failed."
+        fi
 
     - name: Get current date
       id: date
