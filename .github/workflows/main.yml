@@ -48,7 +48,7 @@ jobs:
     - name: Get Resource
       run: |
         # Use GitHub mirror (Googlesource blocks CI)
-        git clone https://github.com/chromium/depot_tools.git
+        git clone https://chromium.googlesource.com/chromium/tools/depot_tools.git
         export PATH="$PATH:$PWD/depot_tools"
 
         # Fetch Dart source
@@ -109,12 +109,12 @@ jobs:
       run: echo $TAG_NAME - $RELEASE_TIME
       env:
         TAG_NAME: Dart-SDK
-        RELEASE_TIME: 3.3.2
+        RELEASE_TIME: latest-dev
 
     - name: Release SDK
       uses: ncipollo/release-action@v1
       with:
         artifacts: "dart-sdk/sdk/out/*.zip"
-        tag: Dart-SDK-3.3.2
+        tag: Dart-SDK-latest-dev
         token: ${{ secrets.GH_TOKEN }}
         allowUpdates: true
